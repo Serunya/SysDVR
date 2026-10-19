@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- SysDVR sysmodule in USB mode: 18D1:4EE0 -->
+    <usb-device
+        vendor-id="6353"
+        product-id="20192" />
+</resources>

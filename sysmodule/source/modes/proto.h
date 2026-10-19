@@ -47,6 +47,10 @@ typedef struct {
 	ProtoHandshakeResponse Result;
 	bool RequestedAudio;
 	bool RequestedVideo;
+	uint8_t JpegFlags; // ExtraFeatureFlags_Jpeg* bits
+	uint8_t JpegMaxFps;
+	bool SystemAudio;
+	uint8_t FeatureFlags;
 } ProtoParsedHandshake;
 
 enum ProtoMetaFlags // 8 bits
@@ -69,6 +73,16 @@ enum ExtraFeatureFlags // 8 bits
 	ExtraFeatureFlags_TurnOffScreen = (1 << 0),
 	// Request a memory report before starting to stream to debug the state of the console
 	ExtraFeatureFlags_MemoryDiag = (1 << 1),
+	// LiteDock: send caps:sc JPEG screenshots while grc produces no video (HOME menu, games without video capture)
+	ExtraFeatureFlags_JpegFallback = (1 << 2),
+	// LiteDock: only send JPEG screenshots, never grc video (for latency / quality comparison)
+	ExtraFeatureFlags_JpegOnly = (1 << 3),
+	// LiteDock: audio from the final output recorder instead of grc (HOME menu sounds, before the volume)
+	ExtraFeatureFlags_SystemAudio = (1 << 4),
+	// LiteDock dock mode: mute the built-in speaker while connected (system audio is captured before the volume)
+	ExtraFeatureFlags_MuteSpeaker = (1 << 5),
+	// LiteDock dock mode: disable the handheld auto sleep while connected
+	ExtraFeatureFlags_KeepAwake = (1 << 6),
 };
 
 // Sent by the client to set up streaming
@@ -84,6 +98,7 @@ struct ProtoHandshakeRequest
 	uint8_t AudioBatching;
 
 	uint8_t FeatureFlags;
+	// LiteDock: Reserved[0] is the max JPEG frame rate, 0 means default. Ignored by upstream sysmodules.
 	uint8_t Reserved[6];
 };
 
@@ -102,3 +117,7 @@ ProtoParsedHandshake ProtoHandshake(ProtoHandshakeAccept config, uint8_t* data, 
 
 // Must be called every time ProtoHandshake returned OK, it is safe to call multiple times
 void ProtoClientGlobalStateDisconnected();
+
+// LiteDock: results (libnx Result) of the dock mode actions of the last handshake, for diagnostics
+extern uint32_t ProtoDockSpeakerResult;
+extern uint32_t ProtoDockSleepResult;

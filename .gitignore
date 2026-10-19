@@ -372,3 +372,9 @@ Client/Platform/Linux/tmp/
 Client/Platform/Linux/shared-modules/
 Client/Platform/Linux-x64.zip
 Client/Platform/Resources/linux-x64/native/
+
+# LiteDock
+SysmoduleLiteDock/
+.DS_Store
+# Third party project downloaded for comparison, not part of this repo
+switch-frame-tap/

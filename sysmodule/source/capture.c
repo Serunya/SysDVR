@@ -8,6 +8,44 @@
 
 VideoPacket alignas(0x1000) VPkt;
 AudioPacket alignas(0x1000) APkt;
+static u8 alignas(0x1000) JpegArea[0x1000 + JbufSz];
+JpegPacket* const JPkt = (JpegPacket*)(JpegArea + 0x1000 - sizeof(PacketHeader));
+
+static atomic_ullong lastVideoFrameTick = 0;
+
+#define AREC_BUFFERS 4
+#define AREC_BUFFER_SIZE 0x1000 // 1024 frames of s16 stereo, 21.3 ms
+#define QLAUNCH_PROGRAM_ID 0x0100000000001000ULL
+
+// The final output recorder only records the mix of one applet resource user:
+// aruid 0 is the application, the HOME menu (qlaunch) is recorded with its own aruid (its process id).
+// Both are recorded and mixed.
+typedef struct {
+	u8 alignas(0x1000) Data[AREC_BUFFERS][AREC_BUFFER_SIZE];
+	FinalOutputRecorderBuffer Buffers[AREC_BUFFERS];
+	AudrecRecorder Recorder;
+	Event BufferEvent;
+	u64 Released[AREC_BUFFERS];
+	u64 ReleasedCount, ReleasedIndex;
+	bool Open;
+	u64 Aruid;
+	Result OpenResult;
+	int Peak;
+} ArecSource;
+
+enum { ArecApplication, ArecHome, ArecCount };
+static ArecSource alignas(0x1000) ArecSources[ArecCount];
+static bool audrecInitialized = false;
+static bool capsInitialized = false;
+static bool capsFailed = false;
+static Result lastJpegRc = 0;
+static u64 lastJpegSize = 0;
+
+Result CaptureLastJpegError(u64* size)
+{
+	*size = lastJpegSize;
+	return lastJpegRc;
+}
 
 static Service grcdVideo;
 static Service grcdAudio;
@@ -202,8 +240,275 @@ bool HashVideoPacket(const u8* data, size_t len, u8* outSlot)
 	return false;
 }
 
+static Result ArecOpen(ArecSource* src, u64 aruid)
+{
+	FinalOutputRecorderParameter param = { .sample_rate = 48000, .channel_count = 2 };
+	FinalOutputRecorderParameterInternal info = {0};
+	src->Aruid = aruid;
+
+	Result rc = audrecOpenFinalOutputRecorder(&src->Recorder, &param, aruid, &info);
+	LOG("audrecOpenFinalOutputRecorder(%lx): %x rate %d ch %d fmt %d\n", aruid, rc, info.sample_rate, info.channel_count, info.sample_format);
+	if (R_FAILED(rc))
+		return rc;
+
+	rc = audrecRecorderRegisterBufferEvent(&src->Recorder, &src->BufferEvent);
+	if (R_FAILED(rc))
+		goto fail_close;
+
+	for (int i = 0; i < AREC_BUFFERS; i++)
+	{
+		src->Buffers[i] = (FinalOutputRecorderBuffer){
+			.sample_buffer_ptr = (u64)src->Data[i],
+			.sample_buffer_capacity = AREC_BUFFER_SIZE,
+			.data_size = AREC_BUFFER_SIZE,
+		};
+		rc = audrecRecorderAppendFinalOutputRecorderBuffer(&src->Recorder, (u64)&src->Buffers[i], &src->Buffers[i]);
+		if (R_FAILED(rc))
+			goto fail_event;
+	}
+
+	rc = audrecRecorderStart(&src->Recorder);
+	if (R_FAILED(rc))
+		goto fail_event;
+
+	src->ReleasedCount = src->ReleasedIndex = 0;
+	src->Peak = 0;
+	src->Open = true;
+	return 0;
+
+fail_event:
+	eventClose(&src->BufferEvent);
+fail_close:
+	audrecRecorderClose(&src->Recorder);
+	return rc;
+}
+
+static void ArecClose(ArecSource* src)
+{
+	if (!src->Open)
+		return;
+
+	audrecRecorderStop(&src->Recorder);
+	audrecRecorderClose(&src->Recorder);
+	eventClose(&src->BufferEvent);
+	src->Open = false;
+}
+
+// Index of the next recorded buffer, -1 if none arrived within the timeout
+static int ArecPop(ArecSource* src, u64 timeout_ns, Result* rc)
+{
+	if (src->ReleasedIndex >= src->ReleasedCount)
+	{
+		src->ReleasedIndex = src->ReleasedCount = 0;
+
+		if (R_FAILED(eventWait(&src->BufferEvent, timeout_ns)))
+			return -1;
+		eventClear(&src->BufferEvent);
+
+		u64 count = AREC_BUFFERS, releasedNs = 0;
+		*rc = audrecRecorderGetReleasedFinalOutputRecorderBuffers(&src->Recorder, src->Released, &count, &releasedNs);
+		if (R_FAILED(*rc))
+			return -1;
+
+		src->ReleasedCount = count;
+		if (count == 0)
+			return -1;
+	}
+
+	FinalOutputRecorderBuffer* buffer = (FinalOutputRecorderBuffer*)src->Released[src->ReleasedIndex++];
+	int i = buffer - src->Buffers;
+	return (i >= 0 && i < AREC_BUFFERS) ? i : -1;
+}
+
+static void ArecRequeue(ArecSource* src, int i)
+{
+	audrecRecorderAppendFinalOutputRecorderBuffer(&src->Recorder, (u64)&src->Buffers[i], &src->Buffers[i]);
+}
+
+// Peak of a recorded buffer, also tracked for the diagnostics
+static int ArecPeak(ArecSource* src, int i)
+{
+	const s16* in = (const s16*)src->Data[i];
+	int peak = 0;
+	for (int k = 0; k < AREC_BUFFER_SIZE / 2; k++)
+	{
+		int a = in[k] < 0 ? -in[k] : in[k];
+		if (a > peak) peak = a;
+	}
+	if (peak > src->Peak)
+		src->Peak = peak;
+	return peak;
+}
+
+bool CaptureSystemAudioStart(Result* out_rc)
+{
+	if (ArecSources[ArecApplication].Open)
+		return true;
+
+	Result rc = 0;
+	if (!audrecInitialized)
+	{
+		rc = audrecInitialize();
+		LOG("audrecInitialize: %x\n", rc);
+		if (R_FAILED(rc))
+		{
+			*out_rc = rc;
+			return false;
+		}
+		audrecInitialized = true;
+	}
+
+	rc = ArecOpen(&ArecSources[ArecApplication], 0);
+	ArecSources[ArecApplication].OpenResult = rc;
+	if (R_FAILED(rc))
+	{
+		*out_rc = rc;
+		return false;
+	}
+
+	// The HOME menu is optional, the application audio works without it
+	u64 pid = 0;
+	rc = pmdmntInitialize();
+	if (R_SUCCEEDED(rc))
+	{
+		rc = pmdmntGetProcessId(&pid, QLAUNCH_PROGRAM_ID);
+		pmdmntExit();
+	}
+	if (R_SUCCEEDED(rc))
+		rc = ArecOpen(&ArecSources[ArecHome], pid);
+	ArecSources[ArecHome].Aruid = pid;
+	ArecSources[ArecHome].OpenResult = rc;
+	return true;
+}
+
+void CaptureSystemAudioStop()
+{
+	for (int i = 0; i < ArecCount; i++)
+		ArecClose(&ArecSources[i]);
+}
+
+void CaptureSystemAudioStatus(u64* homeAruid, Result* homeResult, int* applicationPeak, int* homePeak)
+{
+	*homeAruid = ArecSources[ArecHome].Aruid;
+	*homeResult = ArecSources[ArecHome].OpenResult;
+	*applicationPeak = ArecSources[ArecApplication].Peak;
+	*homePeak = ArecSources[ArecHome].Peak;
+	ArecSources[ArecApplication].Peak = 0;
+	ArecSources[ArecHome].Peak = 0;
+}
+
+bool CaptureReadSystemAudio(Result* out_rc)
+{
+	*out_rc = 0;
+	ArecSource* app = &ArecSources[ArecApplication];
+	ArecSource* home = &ArecSources[ArecHome];
+	s16* out = (s16*)APkt.Data;
+
+	// The application recorder is the clock. If it doesn't deliver (no game ever started?) the HOME one takes over.
+	ArecSource* chosen = NULL;
+	int chosenIndex = -1, chosenPeak = -1;
+
+	int i = ArecPop(app, home->Open ? 30000000ULL : 100000000ULL, out_rc);
+	if (i >= 0)
+	{
+		chosen = app;
+		chosenIndex = i;
+		chosenPeak = ArecPeak(app, i);
+	}
+	else if (R_FAILED(*out_rc))
+		return false;
+
+	if (home->Open)
+	{
+		Result rc = 0;
+		// Use the newest buffer, drop older ones so the HOME recorder can't lag behind
+		int latest = -1, next;
+		while ((next = ArecPop(home, chosen ? 0 : 70000000ULL, &rc)) >= 0)
+		{
+			if (latest >= 0)
+				ArecRequeue(home, latest);
+			latest = next;
+			if (!chosen)
+				break;
+		}
+
+		// Both recorders turned out to deliver the same final mix most of the time, summing them
+		// doubles the volume and clips. Keep the louder one: it covers one of them being silent.
+		if (latest >= 0)
+		{
+			int peak = ArecPeak(home, latest);
+			if (peak > chosenPeak)
+			{
+				if (chosen)
+					ArecRequeue(chosen, chosenIndex);
+				chosen = home;
+				chosenIndex = latest;
+				chosenPeak = peak;
+			}
+			else
+				ArecRequeue(home, latest);
+		}
+	}
+
+	if (!chosen)
+		return false;
+
+	memcpy(out, chosen->Data[chosenIndex], AREC_BUFFER_SIZE);
+	ArecRequeue(chosen, chosenIndex);
+
+	APkt.Header.Magic = STREAM_PACKET_HEADER;
+	APkt.Header.MetaData = PacketMeta_Type_Audio | PacketMeta_Content_Data;
+	APkt.Header.ReplaySlot = 0xFF;
+	APkt.Header.DataSize = AREC_BUFFER_SIZE;
+	APkt.Header.Timestamp = armTicksToNs(armGetSystemTick()) / 1000;
+	return true;
+}
+
+u64 CaptureVideoIdleNs()
+{
+	return armTicksToNs(armGetSystemTick() - lastVideoFrameTick);
+}
+
+bool CaptureReadJpeg()
+{
+	if (capsFailed)
+		return false;
+
+	if (!capsInitialized)
+	{
+		Result rc = capsscInitialize();
+		LOG("capsscInitialize: %x\n", rc);
+		if (R_FAILED(rc))
+		{
+			capsFailed = true;
+			lastJpegRc = rc;
+			lastJpegSize = 0;
+			return false;
+		}
+		capsInitialized = true;
+	}
+
+	u64 size = 0;
+	Result rc = capsscCaptureJpegScreenShot(&size, JPkt->Data, JbufSz, ViLayerStack_Default, 100000000LL);
+	if (R_FAILED(rc) || size == 0 || size > JbufSz)
+	{
+		LOG("capsscCaptureJpegScreenShot failed: %x size: %lx\n", rc, size);
+		lastJpegRc = rc;
+		lastJpegSize = size;
+		return false;
+	}
+
+	JPkt->Header.Magic = STREAM_PACKET_HEADER;
+	JPkt->Header.DataSize = (u32)size;
+	JPkt->Header.Timestamp = armTicksToNs(armGetSystemTick()) / 1000;
+	JPkt->Header.MetaData = PacketMeta_Type_Video | PacketMeta_Content_Data | PacketMeta_Content_Jpeg;
+	JPkt->Header.ReplaySlot = 0xFF;
+	return true;
+}
+
 void CaptureVideoConnected()
 {
+	lastVideoFrameTick = armGetSystemTick();
 	memset(NalHashes, 0, sizeof(NalHashes));
 	VPkt.Header.Magic = STREAM_PACKET_HEADER;
 	VPkt.Header.MetaData = PacketMeta_Type_Video;
@@ -234,6 +539,9 @@ bool CaptureReadVideo()
 
 	VPkt.Header.DataSize = dataSize;
 	VPkt.Header.Timestamp = timestamp;
+
+	if (R_SUCCEEDED(res))
+		lastVideoFrameTick = armGetSystemTick();
 	VPkt.Header.ReplaySlot = 0xFF;
 
 	bool result = R_SUCCEEDED(res) && VPkt.Header.DataSize > 4;
@@ -339,6 +647,19 @@ Result CaptureInitialize()
 
 void CaptureFinalize()
 {
+	CaptureSystemAudioStop();
+	if (audrecInitialized)
+	{
+		audrecExit();
+		audrecInitialized = false;
+	}
+
+	if (capsInitialized)
+	{
+		capsscExit();
+		capsInitialized = false;
+	}
+
 	grcdServiceClose(&grcdVideo);
 	grcdServiceClose(&grcdAudio);
 }

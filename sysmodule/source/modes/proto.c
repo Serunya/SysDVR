@@ -39,6 +39,14 @@ static ProtoHandshakeResultCode ProtoHandshakeVersion(uint8_t* data, int length,
 
 static bool screenStateModified = false;
 
+// LiteDock dock mode, restored on disconnect like the screen
+static bool speakerMuteModified = false;
+static bool speakerWasMuted = false;
+static bool sleepPlanModified = false;
+static s32 previousSleepPlan = 0;
+uint32_t ProtoDockSpeakerResult = 0;
+uint32_t ProtoDockSleepResult = 0;
+
 static void QueryMemoryState(ProtoParsedHandshake* response)
 {
 	u64 application_size = 0, application_used = 0;
@@ -74,6 +82,20 @@ static void ProtoGlobalClientStateConnect(uint8_t protocolFlags, ProtoParsedHand
 		screenStateModified = true;
 	}
 
+	ProtoDockSpeakerResult = 0;
+	if ((protocolFlags & ExtraFeatureFlags_MuteSpeaker) && !speakerMuteModified)
+	{
+		ProtoDockSpeakerResult = UtilSetSpeakerMute(true, &speakerWasMuted);
+		speakerMuteModified = R_SUCCEEDED(ProtoDockSpeakerResult);
+	}
+
+	ProtoDockSleepResult = 0;
+	if ((protocolFlags & ExtraFeatureFlags_KeepAwake) && !sleepPlanModified)
+	{
+		ProtoDockSleepResult = UtilSetHandheldSleepPlan(SetSysHandheldSleepPlan_Never, &previousSleepPlan);
+		sleepPlanModified = R_SUCCEEDED(ProtoDockSleepResult);
+	}
+
 	if (protocolFlags & ExtraFeatureFlags_MemoryDiag)
 	{
 		QueryMemoryState(response);
@@ -90,6 +112,18 @@ void ProtoClientGlobalStateDisconnected()
 	{
 		screenStateModified = false;
 		UtilSetConsoleScreenMode(true);
+	}
+
+	if (speakerMuteModified)
+	{
+		speakerMuteModified = false;
+		UtilSetSpeakerMute(speakerWasMuted, NULL);
+	}
+
+	if (sleepPlanModified)
+	{
+		sleepPlanModified = false;
+		UtilSetHandheldSleepPlan(previousSleepPlan, NULL);
 	}
 }
 
@@ -121,6 +155,8 @@ ProtoParsedHandshake ProtoHandshake(ProtoHandshakeAccept config, uint8_t* data, 
 		CaptureSetPPSSPSInject(req.VideoFlags & ProtoMetaVideo_InjectPPSSPS);
 
 		res.RequestedVideo = true;
+		res.JpegFlags = req.FeatureFlags & (ExtraFeatureFlags_JpegFallback | ExtraFeatureFlags_JpegOnly);
+		res.JpegMaxFps = req.Reserved[0];
 	}
 
 	if (req.MetaFlags & ProtoMeta_Audio)
@@ -129,10 +165,12 @@ ProtoParsedHandshake ProtoHandshake(ProtoHandshakeAccept config, uint8_t* data, 
 			res.Result.Code = Handshake_InvalidArg;
 
 		res.RequestedAudio = true;
+		res.SystemAudio = req.FeatureFlags & ExtraFeatureFlags_SystemAudio;
 	}
 
 	if (res.Result.Code == Handshake_Ok)
 	{
+		res.FeatureFlags = req.FeatureFlags;
 		ProtoGlobalClientStateConnect(req.FeatureFlags, &res);
 	}
 
